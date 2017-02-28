@@ -26,7 +26,7 @@ function assertResults(expected, query, context) {
     debug(query);
     assert.eq(expected.length, t.count(query), 'unexpected count in ' + context);
     results = t.find(query).toArray();
-    for (i in results) {
+    for (let i = 0; i < results.length; ++i) {
         found = false;
         for (j in expected) {
             if (friendlyEqual(expected[j], results[i].a)) {
