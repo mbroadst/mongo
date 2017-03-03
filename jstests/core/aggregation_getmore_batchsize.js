@@ -34,5 +34,6 @@
 
     // Check that the default cursor behavior works if you specify a cursor but no batch size.
     cursor = coll.aggregate([{$match: {a: 1}}, {$limit: 6}], {cursor: {}});
+    cursor.hasNext(); // actually execute the aggregation
     assert.eq(cursor.objsLeftInBatch(), 6);
 })();
