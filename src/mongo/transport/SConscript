@@ -31,7 +31,111 @@ env.Library(
     ],
 )
 
-tlEnv = env.Clone()
+grpcEnv = env.Clone()
+grpcEnv.InjectThirdParty(libraries=['asio'])
+
+# TODO: Remove third_party abseil since gRPC is built with its own copy. This should
+#       not be required in the future if we bundle gRPC itself, we can link to our
+#       own vendored libabseil.
+grpcEnv['CPPPATH'] = [p for p in grpcEnv['CPPPATH'] if not 'abseil' in p]
+grpcPrefix = grpcEnv['GRPC_PREFIX']
+# NOTE: I tried using grpcEnv.File and grpcEnv.Dir for all of this to no avail, LIBDEPS
+#       does not seem to support file nodes.
+grpcLibDepNames = [
+    'libaddress_sorting',
+    'libcares_static',
+    'libgpr',
+    'libgrpc',
+    'libgrpc++',
+    'libgrpc++_reflection',
+    'libprotobuf',
+    'libupb',
+    'libre2',
+
+    'libabsl_bad_any_cast_impl',
+    'libabsl_bad_optional_access',
+    'libabsl_bad_variant_access',
+    'libabsl_base',
+    'libabsl_city',
+    'libabsl_civil_time',
+    'libabsl_cord',
+    'libabsl_debugging_internal',
+    'libabsl_demangle_internal',
+    'libabsl_examine_stack',
+    'libabsl_exponential_biased',
+    'libabsl_failure_signal_handler',
+    'libabsl_flags',
+    'libabsl_flags_commandlineflag',
+    'libabsl_flags_commandlineflag_internal',
+    'libabsl_flags_config',
+    'libabsl_flags_internal',
+    'libabsl_flags_marshalling',
+    'libabsl_flags_parse',
+    'libabsl_flags_private_handle_accessor',
+    'libabsl_flags_program_name',
+    'libabsl_flags_reflection',
+    'libabsl_flags_usage',
+    'libabsl_flags_usage_internal',
+    'libabsl_graphcycles_internal',
+    'libabsl_hash',
+    'libabsl_hashtablez_sampler',
+    'libabsl_int128',
+    'libabsl_leak_check',
+    'libabsl_leak_check_disable',
+    'libabsl_log_severity',
+    'libabsl_malloc_internal',
+    'libabsl_periodic_sampler',
+    'libabsl_random_distributions',
+    'libabsl_random_internal_distribution_test_util',
+    'libabsl_random_internal_platform',
+    'libabsl_random_internal_pool_urbg',
+    'libabsl_random_internal_randen',
+    'libabsl_random_internal_randen_hwaes',
+    'libabsl_random_internal_randen_hwaes_impl',
+    'libabsl_random_internal_randen_slow',
+    'libabsl_random_internal_seed_material',
+    'libabsl_random_seed_gen_exception',
+    'libabsl_random_seed_sequences',
+    'libabsl_raw_hash_set',
+    'libabsl_raw_logging_internal',
+    'libabsl_scoped_set_env',
+    'libabsl_spinlock_wait',
+    'libabsl_stacktrace',
+    'libabsl_status',
+    'libabsl_statusor',
+    'libabsl_str_format_internal',
+    'libabsl_strerror',
+    'libabsl_strings',
+    'libabsl_strings_internal',
+    'libabsl_symbolize',
+    'libabsl_synchronization',
+    'libabsl_throw_delegate',
+    'libabsl_time',
+    'libabsl_time_zone',
+    'libabsl_wyhash',
+]
+
+grpcEnv.Library(
+    target='transport_layer_grpc',
+    source=[
+        'transport_layer_grpc.cpp',
+        'mongodb.grpc.pb.cc',
+        'mongodb.pb.cc',
+    ],
+    LIBDEPS=[
+        'transport_layer_common',
+    ] + [ '%s/lib/%s.a' % (grpcPrefix, lib) for lib in grpcLibDepNames ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/util/net/network',
+        '$BUILD_DIR/third_party/shim_asio', # for ASIOReactor
+    ]
+)
+
+grpcEnv.AppendUnique(
+    CPPPATH=['%s/include' % grpcPrefix],
+)
+
+tlEnv = grpcEnv.Clone()
 tlEnv.InjectThirdParty(libraries=['asio'])
 
 tlEnv.Library(
@@ -41,6 +145,7 @@ tlEnv.Library(
     ],
     LIBDEPS=[
         'transport_layer',
+        'transport_layer_grpc'
     ],
     LIBDEPS_PRIVATE=[
         'service_executor',
