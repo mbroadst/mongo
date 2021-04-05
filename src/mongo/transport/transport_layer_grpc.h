@@ -29,7 +29,8 @@
 
 #pragma once
 
-#include <grpc++/grpc++.h>
+#define GRPC_CALLBACK_API_NONEXPERIMENTAL 1
+#include <grpcpp/grpcpp.h>
 
 #include "mongo/base/status.h"
 #include "mongo/transport/transport_layer.h"
@@ -65,10 +66,10 @@ public:
     virtual ReactorHandle getReactor(WhichReactor which) override;
 
 private:
-    class TransportServiceImpl final : public mongodb::Transport::Service {
-        grpc::Status SendMessage(grpc::ServerContext* context,
-                                 const mongodb::Message* request,
-                                 mongodb::Message* reply) override;
+    class TransportServiceImpl final : public mongodb::Transport::CallbackService {
+        grpc::ServerUnaryReactor* SendMessage(grpc::CallbackServerContext* context,
+                                              const mongodb::Message* request,
+                                              mongodb::Message* response) override;
     };
 
     ServiceEntryPoint* const _sep;

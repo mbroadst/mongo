@@ -40,12 +40,14 @@
 namespace mongo {
 namespace transport {
 
-grpc::Status TransportLayerGRPC::TransportServiceImpl::SendMessage(
-    grpc::ServerContext* context,
+grpc::ServerUnaryReactor* TransportLayerGRPC::TransportServiceImpl::SendMessage(
+    grpc::CallbackServerContext* context,
     const mongodb::Message* request,
-    mongodb::Message* reply) {
-    reply->set_payload("RESPONSE FROM SERVER");
-    return grpc::Status::OK;
+    mongodb::Message* response) {
+    response->set_payload("RESPONSE FROM SERVER");
+    grpc::ServerUnaryReactor* reactor = context->DefaultReactor();
+    reactor->Finish(grpc::Status::OK);
+    return reactor;
 }
 
 TransportLayerGRPC::TransportLayerGRPC(ServiceEntryPoint* sep) : _sep(sep) {}
