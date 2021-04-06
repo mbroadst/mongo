@@ -28,6 +28,7 @@
  */
 
 #include "mongo/transport/transport_layer_grpc.h"
+#include "mongo/transport/service_entry_point.h"
 
 #include "mongo/platform/basic.h"
 
@@ -40,17 +41,87 @@
 namespace mongo {
 namespace transport {
 
+TransportLayerGRPC::TransportServiceImpl::TransportServiceImpl(TransportLayerGRPC* tl) : _tl(tl) {}
 grpc::ServerUnaryReactor* TransportLayerGRPC::TransportServiceImpl::SendMessage(
     grpc::CallbackServerContext* context,
     const mongodb::Message* request,
     mongodb::Message* response) {
-    response->set_payload("RESPONSE FROM SERVER");
+    auto [pair, emplaced] = _tl->_sessions.try_emplace(context->peer(), new GRPCSession(_tl));
+
+    auto session = pair->second;
     grpc::ServerUnaryReactor* reactor = context->DefaultReactor();
-    reactor->Finish(grpc::Status::OK);
+    session->addRequest(request, response, reactor);
+
+    // if this is a new session, then we need to actually start it
+    if (emplaced) {
+        // TODO: how are these ever removed!
+        _tl->_sep->startSession(std::move(session));
+    }
+
     return reactor;
 }
 
-TransportLayerGRPC::TransportLayerGRPC(ServiceEntryPoint* sep) : _sep(sep) {}
+void TransportLayerGRPC::GRPCSession::end() {
+    _ended = true;
+
+    for (auto request : _pendingRequests) {
+        request.reactor->Finish(grpc::Status::CANCELLED);
+    }
+    _pendingRequests.clear();
+
+    for (auto [id, request] : _activeRequests) {
+        request.reactor->Finish(grpc::Status::CANCELLED);
+    }
+    _activeRequests.clear();
+
+    // notify waiters that we have ended
+    _waitForPending.notify_one();
+}
+
+void TransportLayerGRPC::GRPCSession::addRequest(const mongodb::Message* request,
+                                                 mongodb::Message* response,
+                                                 grpc::ServerUnaryReactor* reactor) {
+    {
+        stdx::lock_guard<Latch> lk(_mutex);
+        _pendingRequests.emplace_back(PendingRequest{request, response, reactor});
+    }
+
+    _waitForPending.notify_one();
+}
+
+StatusWith<Message> TransportLayerGRPC::GRPCSession::sourceMessage() {
+    std::unique_lock<Latch> ul(_mutex);
+    _waitForPending.wait(ul, [this] { return _pendingRequests.size() > 0 || _ended; });
+    if (_ended) {
+        return Message();
+    }
+
+    auto request = _pendingRequests.front().request;
+    auto requestMessage = request->payload();
+    auto buffer = SharedBuffer::allocate(requestMessage.size());
+    memcpy(buffer.get(), requestMessage.data(), requestMessage.size());
+
+    auto message = Message(std::move(buffer));
+    _activeRequests.emplace(message.header().getId(), std::move(_pendingRequests.front()));
+    _pendingRequests.pop_front();
+    return message;
+}
+
+Status TransportLayerGRPC::GRPCSession::sinkMessage(Message message) {
+    auto id = message.header().getResponseToMsgId();
+    if (!_activeRequests.contains(id)) {
+        return TransportLayer::SessionUnknownStatus;
+    }
+
+    stdx::lock_guard<Latch> lk(_mutex);
+    auto [request, response, reactor] = _activeRequests[id];
+    _activeRequests.erase(id);
+    response->set_payload(std::string(message.buf(), message.size()));
+    reactor->Finish(grpc::Status::OK);
+    return Status::OK();
+}
+
+TransportLayerGRPC::TransportLayerGRPC(ServiceEntryPoint* sep) : _sep(sep), _service(this) {}
 
 StatusWith<SessionHandle> TransportLayerGRPC::connect(HostAndPort peer,
                                                       ConnectSSLMode sslMode,
@@ -85,6 +156,7 @@ Status TransportLayerGRPC::start() {
 }
 
 void TransportLayerGRPC::shutdown() {
+    _sessions.clear();
     _server->Shutdown();
 }
 

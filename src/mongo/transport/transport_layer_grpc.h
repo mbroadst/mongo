@@ -67,9 +67,94 @@ public:
 
 private:
     class TransportServiceImpl final : public mongodb::Transport::CallbackService {
+    public:
+        explicit TransportServiceImpl(TransportLayerGRPC* transportLayer);
+
+    private:
         grpc::ServerUnaryReactor* SendMessage(grpc::CallbackServerContext* context,
                                               const mongodb::Message* request,
                                               mongodb::Message* response) override;
+
+        TransportLayerGRPC* _tl;
+    };
+
+    class GRPCSession : public Session {
+        GRPCSession(const GRPCSession&) = delete;
+        GRPCSession& operator=(const GRPCSession&) = delete;
+
+    public:
+        explicit GRPCSession(TransportLayer* tl)
+            : _tl(checked_cast<TransportLayerGRPC*>(tl)), _remote(), _local() {
+            setTags(kDefaultBatonHack);
+        }
+
+        ~GRPCSession() {
+            end();
+        }
+
+        TransportLayer* getTransportLayer() const override {
+            return _tl;
+        }
+
+        const HostAndPort& remote() const override {
+            return _remote;
+        }
+
+        const HostAndPort& local() const override {
+            return _local;
+        }
+
+        const SockAddr& remoteAddr() const override {
+            return _remoteAddr;
+        }
+
+        const SockAddr& localAddr() const override {
+            return _localAddr;
+        }
+
+        void end() override;
+        StatusWith<Message> sourceMessage() override;
+        Future<Message> asyncSourceMessage(const BatonHandle& handle = nullptr) override {
+            return Future<Message>::makeReady(sourceMessage());
+        }
+
+        Status sinkMessage(Message message) override;
+        Future<void> asyncSinkMessage(Message message,
+                                      const BatonHandle& handle = nullptr) override {
+            return Future<void>::makeReady(sinkMessage(message));
+        }
+
+        // TODO: do we need these?
+        void cancelAsyncOperations(const BatonHandle& handle = nullptr) override {}
+        void setTimeout(boost::optional<Milliseconds>) override {}
+        bool isConnected() override {
+            return true;
+        }
+
+        void addRequest(const mongodb::Message* request,
+                        mongodb::Message* response,
+                        grpc::ServerUnaryReactor* reactor);
+
+    protected:
+        friend class TransportLayerGRPC::TransportServiceImpl;
+        TransportLayerGRPC* _tl;
+
+        HostAndPort _remote;
+        HostAndPort _local;
+        SockAddr _remoteAddr;
+        SockAddr _localAddr;
+
+        struct PendingRequest {
+            const mongodb::Message* request;
+            mongodb::Message* response;
+            grpc::ServerUnaryReactor* reactor;
+        };
+
+        bool _ended = false;
+        Mutex _mutex = MONGO_MAKE_LATCH("GRPCSession::_mutex");
+        std::list<PendingRequest> _pendingRequests;
+        stdx::unordered_map<int32_t, PendingRequest> _activeRequests;
+        stdx::condition_variable _waitForPending;
     };
 
     ServiceEntryPoint* const _sep;
@@ -77,6 +162,8 @@ private:
     std::unique_ptr<grpc::Server> _server;
     TransportServiceImpl _service;
 
+    using GRPCSessionHandle = std::shared_ptr<GRPCSession>;
+    stdx::unordered_map<std::string, GRPCSessionHandle> _sessions;
 };
 
 }  // namespace transport
