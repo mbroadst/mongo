@@ -162,6 +162,7 @@ private:
     std::unique_ptr<grpc::Server> _server;
     TransportServiceImpl _service;
 
+    Mutex _mutex = MONGO_MAKE_LATCH("TransportLayerGRPC::_mutex");
     using GRPCSessionHandle = std::shared_ptr<GRPCSession>;
     stdx::unordered_map<std::string, GRPCSessionHandle> _sessions;
 };

@@ -46,16 +46,27 @@ grpc::ServerUnaryReactor* TransportLayerGRPC::TransportServiceImpl::SendMessage(
     grpc::CallbackServerContext* context,
     const mongodb::Message* request,
     mongodb::Message* response) {
-    auto [pair, emplaced] = _tl->_sessions.try_emplace(context->peer(), new GRPCSession(_tl));
-
-    auto session = pair->second;
     grpc::ServerUnaryReactor* reactor = context->DefaultReactor();
-    session->addRequest(request, response, reactor);
+    const auto clientMetadata = context->client_metadata();
+    auto it = clientMetadata.find("lcid");
+    if (it == clientMetadata.end()) {
+        reactor->Finish(grpc::Status(grpc::INVALID_ARGUMENT, "missing required logical connection id"));
+        return reactor;
+    }
 
-    // if this is a new session, then we need to actually start it
-    if (emplaced) {
-        // TODO: how are these ever removed!
-        _tl->_sep->startSession(std::move(session));
+    auto lcid = std::string(it->second.begin(), it->second.end());
+    {
+        stdx::lock_guard<Latch> lk(_tl->_mutex);
+        auto [pair, emplaced] = _tl->_sessions.try_emplace(lcid, new GRPCSession(_tl));
+        auto session = pair->second;
+        session->addRequest(request, response, reactor);
+
+        // if this is a new session, then we need to actually start it
+        if (emplaced) {
+            // TODO: how are these ever removed!
+            std::cout << "new sessions started for lcid: " << lcid << std::endl;
+            _tl->_sep->startSession(std::move(session));
+        }
     }
 
     return reactor;
