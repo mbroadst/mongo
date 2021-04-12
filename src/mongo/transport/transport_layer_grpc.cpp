@@ -41,6 +41,19 @@
 namespace mongo {
 namespace transport {
 
+// borrowed from https://jguegant.github.io/blogs/tech/performing-try-emplace.html
+template <class Factory>
+struct lazy_convert_construct {
+    using result_type = std::invoke_result_t<const Factory&>;
+
+    constexpr lazy_convert_construct(Factory&& factory) : factory_(std::move(factory)) {}
+    constexpr operator result_type() const noexcept(std::is_nothrow_invocable_v<const Factory&>) {
+        return factory_();
+    }
+
+    Factory factory_;
+};
+
 TransportLayerGRPC::TransportServiceImpl::TransportServiceImpl(TransportLayerGRPC* tl) : _tl(tl) {}
 grpc::ServerUnaryReactor* TransportLayerGRPC::TransportServiceImpl::SendMessage(
     grpc::CallbackServerContext* context,
@@ -50,85 +63,76 @@ grpc::ServerUnaryReactor* TransportLayerGRPC::TransportServiceImpl::SendMessage(
     const auto clientMetadata = context->client_metadata();
     auto it = clientMetadata.find("lcid");
     if (it == clientMetadata.end()) {
-        reactor->Finish(grpc::Status(grpc::INVALID_ARGUMENT, "missing required logical connection id"));
+        reactor->Finish(
+            grpc::Status(grpc::INVALID_ARGUMENT, "missing required logical connection id"));
         return reactor;
     }
 
     auto lcid = std::string(it->second.begin(), it->second.end());
+
+    /*
+    absl::flat_hash_map<std::string, GRPCSessionHandle>::iterator sit = _tl->_sessions.find(lcid);
+    GRPCSessionHandle session;
+    if (sit == _tl->_sessions.end()) {
+        stdx::lock_guard<Latch> lk(_tl->_mutex);
+        auto result = _tl->_sessions.emplace(lcid, std::make_shared<GRPCSession>(_tl, lcid));
+        if (!result.second) {
+            reactor->Finish(
+                grpc::Status(grpc::INVALID_ARGUMENT, "unable to create server session"));
+            return reactor;
+        }
+
+        session = result.first->second;
+
+        // TODO: how are these ever removed!
+        _tl->_sep->startSession(session);
+    } else {
+        session = sit->second;
+    }
+    */
+
+    std::pair<absl::flat_hash_map<std::string, GRPCSessionHandle>::iterator, bool> result;
     {
         stdx::lock_guard<Latch> lk(_tl->_mutex);
-        auto [pair, emplaced] = _tl->_sessions.try_emplace(lcid, new GRPCSession(_tl));
-        auto session = pair->second;
-        session->addRequest(request, response, reactor);
+        result = _tl->_sessions.try_emplace(
+            lcid, lazy_convert_construct([&] { return std::make_shared<GRPCSession>(_tl, lcid);
+            }));
+    }
 
-        // if this is a new session, then we need to actually start it
-        if (emplaced) {
-            // TODO: how are these ever removed!
-            std::cout << "new sessions started for lcid: " << lcid << std::endl;
-            _tl->_sep->startSession(std::move(session));
-        }
+    auto session = result.first->second;
+    session->_pendingRequests.push(new GRPCSession::PendingRequest{request, response, reactor});
+
+    if (result.second) {
+        // TODO: how are these ever removed!
+        _tl->_sep->startSession(session);
     }
 
     return reactor;
 }
 
 void TransportLayerGRPC::GRPCSession::end() {
-    _ended = true;
-
-    for (auto request : _pendingRequests) {
-        request.reactor->Finish(grpc::Status::CANCELLED);
+    auto [requests, bytes] = _pendingRequests.popMany();
+    for (auto request : requests) {
+        request->reactor->Finish(grpc::Status::CANCELLED);
     }
-    _pendingRequests.clear();
-
-    for (auto [id, request] : _activeRequests) {
-        request.reactor->Finish(grpc::Status::CANCELLED);
-    }
-    _activeRequests.clear();
-
-    // notify waiters that we have ended
-    _waitForPending.notify_one();
-}
-
-void TransportLayerGRPC::GRPCSession::addRequest(const mongodb::Message* request,
-                                                 mongodb::Message* response,
-                                                 grpc::ServerUnaryReactor* reactor) {
-    {
-        stdx::lock_guard<Latch> lk(_mutex);
-        _pendingRequests.emplace_back(PendingRequest{request, response, reactor});
-    }
-
-    _waitForPending.notify_one();
+    requests.clear();
 }
 
 StatusWith<Message> TransportLayerGRPC::GRPCSession::sourceMessage() {
-    std::unique_lock<Latch> ul(_mutex);
-    _waitForPending.wait(ul, [this] { return _pendingRequests.size() > 0 || _ended; });
-    if (_ended) {
-        return Message();
-    }
-
-    auto request = _pendingRequests.front().request;
-    auto requestMessage = request->payload();
+    _currentRequest = _pendingRequests.pop();
+    auto requestMessage = _currentRequest->request->payload();
     auto buffer = SharedBuffer::allocate(requestMessage.size());
     memcpy(buffer.get(), requestMessage.data(), requestMessage.size());
-
-    auto message = Message(std::move(buffer));
-    _activeRequests.emplace(message.header().getId(), std::move(_pendingRequests.front()));
-    _pendingRequests.pop_front();
-    return message;
+    return Message(std::move(buffer));
 }
 
 Status TransportLayerGRPC::GRPCSession::sinkMessage(Message message) {
-    auto id = message.header().getResponseToMsgId();
-    if (!_activeRequests.contains(id)) {
-        return TransportLayer::SessionUnknownStatus;
-    }
+    _currentRequest->response->set_payload(std::string(message.buf(), message.size()));
+    _currentRequest->reactor->Finish(grpc::Status::OK);
 
-    stdx::lock_guard<Latch> lk(_mutex);
-    auto [request, response, reactor] = _activeRequests[id];
-    _activeRequests.erase(id);
-    response->set_payload(std::string(message.buf(), message.size()));
-    reactor->Finish(grpc::Status::OK);
+    delete _currentRequest;
+    _currentRequest = nullptr;
+
     return Status::OK();
 }
 

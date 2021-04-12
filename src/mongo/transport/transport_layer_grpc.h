@@ -32,9 +32,12 @@
 #define GRPC_CALLBACK_API_NONEXPERIMENTAL 1
 #include <grpcpp/grpcpp.h>
 
+#include <absl/container/flat_hash_map.h>
+
 #include "mongo/base/status.h"
 #include "mongo/transport/transport_layer.h"
 #include "mongo/util/net/ssl_types.h"
+#include "mongo/util/producer_consumer_queue.h"
 #include "mongo/util/time_support.h"
 
 #include "mongo/transport/mongodb.grpc.pb.h"
@@ -83,8 +86,8 @@ private:
         GRPCSession& operator=(const GRPCSession&) = delete;
 
     public:
-        explicit GRPCSession(TransportLayer* tl)
-            : _tl(checked_cast<TransportLayerGRPC*>(tl)), _remote(), _local() {
+        explicit GRPCSession(TransportLayer* tl, const std::string& lcid)
+            : _tl(checked_cast<TransportLayerGRPC*>(tl)), _lcid(lcid) {
             setTags(kDefaultBatonHack);
         }
 
@@ -94,6 +97,10 @@ private:
 
         TransportLayer* getTransportLayer() const override {
             return _tl;
+        }
+
+        const std::string& lcid() const {
+            return _lcid;
         }
 
         const HostAndPort& remote() const override {
@@ -131,16 +138,13 @@ private:
             return true;
         }
 
-        void addRequest(const mongodb::Message* request,
-                        mongodb::Message* response,
-                        grpc::ServerUnaryReactor* reactor);
-
     protected:
         friend class TransportLayerGRPC::TransportServiceImpl;
         TransportLayerGRPC* _tl;
+        std::string _lcid;
 
-        HostAndPort _remote;
-        HostAndPort _local;
+        HostAndPort _remote{};
+        HostAndPort _local{};
         SockAddr _remoteAddr;
         SockAddr _localAddr;
 
@@ -150,21 +154,21 @@ private:
             grpc::ServerUnaryReactor* reactor;
         };
 
-        bool _ended = false;
         Mutex _mutex = MONGO_MAKE_LATCH("GRPCSession::_mutex");
-        std::list<PendingRequest> _pendingRequests;
-        stdx::unordered_map<int32_t, PendingRequest> _activeRequests;
-        stdx::condition_variable _waitForPending;
+        // TODO: using PendingRequestPtr = std::unique_ptr<PendingRequest>;
+        MultiProducerSingleConsumerQueue<PendingRequest*> _pendingRequests;
+        PendingRequest* _currentRequest = nullptr;
     };
 
-    ServiceEntryPoint* const _sep;
+    ServiceEntryPoint* const _sep = nullptr;
     stdx::thread _thread;
     std::unique_ptr<grpc::Server> _server;
     TransportServiceImpl _service;
 
     Mutex _mutex = MONGO_MAKE_LATCH("TransportLayerGRPC::_mutex");
     using GRPCSessionHandle = std::shared_ptr<GRPCSession>;
-    stdx::unordered_map<std::string, GRPCSessionHandle> _sessions;
+    absl::flat_hash_map<std::string, GRPCSessionHandle> _sessions;
+
 };
 
 }  // namespace transport
