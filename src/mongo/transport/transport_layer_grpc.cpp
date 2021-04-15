@@ -36,6 +36,8 @@
 #include <grpcpp/grpcpp.h>
 #include <grpcpp/health_check_service_interface.h>
 
+#include <fmt/format.h>
+
 #include <memory>
 
 namespace mongo {
@@ -54,6 +56,14 @@ struct lazy_convert_construct {
     Factory factory_;
 };
 
+std::mutex g_display_mutex;
+void threadLog(const std::string& message) {
+    std::thread::id this_id = std::this_thread::get_id();
+    g_display_mutex.lock();
+    std::cout << "thread(" << this_id << "): " << message << "\n";
+    g_display_mutex.unlock();
+}
+
 TransportLayerGRPC::TransportServiceImpl::TransportServiceImpl(TransportLayerGRPC* tl) : _tl(tl) {}
 grpc::ServerUnaryReactor* TransportLayerGRPC::TransportServiceImpl::SendMessage(
     grpc::CallbackServerContext* context,
@@ -69,6 +79,7 @@ grpc::ServerUnaryReactor* TransportLayerGRPC::TransportServiceImpl::SendMessage(
     }
 
     auto lcid = std::string(it->second.begin(), it->second.end());
+    threadLog(fmt::format("[{}] processing incoming message", lcid));
 
     /*
     absl::flat_hash_map<std::string, GRPCSessionHandle>::iterator sit = _tl->_sessions.find(lcid);
@@ -123,10 +134,14 @@ StatusWith<Message> TransportLayerGRPC::GRPCSession::sourceMessage() {
     auto requestMessage = _currentRequest->request->payload();
     auto buffer = SharedBuffer::allocate(requestMessage.size());
     memcpy(buffer.get(), requestMessage.data(), requestMessage.size());
-    return Message(std::move(buffer));
+    Message message(std::move(buffer));
+
+    threadLog(fmt::format("[{}] sourced message id: {}", _lcid, message.header().getId()));
+    return std::move(message);
 }
 
 Status TransportLayerGRPC::GRPCSession::sinkMessage(Message message) {
+    threadLog(fmt::format("[{}] sinking message for id: {}", _lcid, message.header().getResponseToMsgId()));
     _currentRequest->response->set_payload(std::string(message.buf(), message.size()));
     _currentRequest->reactor->Finish(grpc::Status::OK);
 
