@@ -158,7 +158,7 @@ std::unique_ptr<TransportLayer> TransportLayerManager::createWithConfig(
 
     // throw on an extra transport layer for gRPC
     std::unique_ptr<TransportLayer> grpcTransport =
-        std::make_unique<transport::TransportLayerGRPC>(sep);
+        std::make_unique<transport::TransportLayerGRPC>(sep, ctx);
     retVector.emplace_back(std::move(grpcTransport));
 
     return std::make_unique<TransportLayerManager>(std::move(retVector));

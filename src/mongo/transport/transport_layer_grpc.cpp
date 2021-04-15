@@ -32,6 +32,8 @@
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/db/stats/counters.h"
+
 #include <grpcpp/ext/proto_server_reflection_plugin.h>
 #include <grpcpp/grpcpp.h>
 #include <grpcpp/health_check_service_interface.h>
@@ -64,6 +66,7 @@ void threadLog(const std::string& message) {
     g_display_mutex.unlock();
 }
 
+int32_t TransportLayerGRPC::TransportServiceImpl::connCounter = 0;
 TransportLayerGRPC::TransportServiceImpl::TransportServiceImpl(TransportLayerGRPC* tl) : _tl(tl) {}
 grpc::ServerUnaryReactor* TransportLayerGRPC::TransportServiceImpl::SendMessage(
     grpc::CallbackServerContext* context,
@@ -79,79 +82,71 @@ grpc::ServerUnaryReactor* TransportLayerGRPC::TransportServiceImpl::SendMessage(
     }
 
     auto lcid = std::string(it->second.begin(), it->second.end());
-    threadLog(fmt::format("[{}] processing incoming message", lcid));
+    // threadLog(fmt::format("[{}] processing incoming message", lcid));
 
-    /*
-    absl::flat_hash_map<std::string, GRPCSessionHandle>::iterator sit = _tl->_sessions.find(lcid);
-    GRPCSessionHandle session;
-    if (sit == _tl->_sessions.end()) {
-        stdx::lock_guard<Latch> lk(_tl->_mutex);
-        auto result = _tl->_sessions.emplace(lcid, std::make_shared<GRPCSession>(_tl, lcid));
-        if (!result.second) {
-            reactor->Finish(
-                grpc::Status(grpc::INVALID_ARGUMENT, "unable to create server session"));
-            return reactor;
-        }
+    auto worker = _tl->getLogicalConnectionWorker(lcid);
+    // threadLog(fmt::format("[{}] sending to handle request", lcid));
+    worker->handleRequest(request, response, reactor);
 
-        session = result.first->second;
-
-        // TODO: how are these ever removed!
-        _tl->_sep->startSession(session);
-    } else {
-        session = sit->second;
-    }
-    */
-
-    std::pair<absl::flat_hash_map<std::string, GRPCSessionHandle>::iterator, bool> result;
-    {
-        stdx::lock_guard<Latch> lk(_tl->_mutex);
-        result = _tl->_sessions.try_emplace(
-            lcid, lazy_convert_construct([&] { return std::make_shared<GRPCSession>(_tl, lcid);
-            }));
-    }
-
-    auto session = result.first->second;
-    session->_pendingRequests.push(new GRPCSession::PendingRequest{request, response, reactor});
-
-    if (result.second) {
-        // TODO: how are these ever removed!
-        _tl->_sep->startSession(session);
-    }
-
+    // threadLog(fmt::format("[{}] returned reactor", lcid));
     return reactor;
 }
 
-void TransportLayerGRPC::GRPCSession::end() {
-    auto [requests, bytes] = _pendingRequests.popMany();
-    for (auto request : requests) {
-        request->reactor->Finish(grpc::Status::CANCELLED);
-    }
-    requests.clear();
+TransportLayerGRPC::Worker::Worker(ServiceContext* svcContext, transport::SessionHandle session)
+    : _sep{svcContext->getServiceEntryPoint()},
+      _serviceContext(svcContext),
+      _serviceExecutor(_serviceContext->getServiceExecutor()),
+      _sessionHandle(session),
+      _threadName{str::stream() << "grpc" << session->id()},
+      _dbClient{svcContext->makeClient(_threadName, std::move(session))} {
 }
 
-StatusWith<Message> TransportLayerGRPC::GRPCSession::sourceMessage() {
-    _currentRequest = _pendingRequests.pop();
-    auto requestMessage = _currentRequest->request->payload();
+void TransportLayerGRPC::Worker::handleRequest(const mongodb::Message* request,
+                                               mongodb::Message* response,
+                                               grpc::ServerUnaryReactor* reactor) {
+    // convert the request payload into a message
+    auto requestMessage = request->payload();
     auto buffer = SharedBuffer::allocate(requestMessage.size());
     memcpy(buffer.get(), requestMessage.data(), requestMessage.size());
+    networkCounter.hitPhysicalIn(requestMessage.size());
     Message message(std::move(buffer));
 
-    threadLog(fmt::format("[{}] sourced message id: {}", _lcid, message.header().getId()));
-    return std::move(message);
+    // this is needed for calls to Client::cc() elsewhere in the code
+    Client::setCurrent(std::move(_dbClient));
+
+    // create a new opCtx and run the request against the server
+    auto opCtx = Client::getCurrent()->makeOperationContext();
+    DbResponse dbresponse = _sep->handleRequest(opCtx.get(), message);
+    opCtx.reset();
+
+    Message& toSink = dbresponse.response;
+    // TODO: there is a whole bunch of stuff chopped out here (compression, exhaust, etc)
+
+    if (toSink.empty()) {
+        _dbClient = Client::releaseCurrent();
+        reactor->Finish(grpc::Status::OK);
+        return;
+    }
+
+    invariant(!OpMsg::isFlagSet(message, OpMsg::kMoreToCome));
+    invariant(!OpMsg::isFlagSet(toSink, OpMsg::kChecksumPresent));
+
+    // Update the header for the response message.
+    toSink.header().setId(nextMessageId());
+    toSink.header().setResponseToMsgId(message.header().getId());
+    if (OpMsg::isFlagSet(message, OpMsg::kChecksumPresent)) {
+        OpMsg::appendChecksum(&toSink);
+    }
+
+    _dbClient = Client::releaseCurrent();
+
+    networkCounter.hitPhysicalOut(toSink.size());
+    response->set_payload(std::string(toSink.buf(), toSink.size()));
+    reactor->Finish(grpc::Status::OK);
 }
 
-Status TransportLayerGRPC::GRPCSession::sinkMessage(Message message) {
-    threadLog(fmt::format("[{}] sinking message for id: {}", _lcid, message.header().getResponseToMsgId()));
-    _currentRequest->response->set_payload(std::string(message.buf(), message.size()));
-    _currentRequest->reactor->Finish(grpc::Status::OK);
-
-    delete _currentRequest;
-    _currentRequest = nullptr;
-
-    return Status::OK();
-}
-
-TransportLayerGRPC::TransportLayerGRPC(ServiceEntryPoint* sep) : _sep(sep), _service(this) {}
+TransportLayerGRPC::TransportLayerGRPC(ServiceEntryPoint* sep, ServiceContext* ctx)
+    : _sep(sep), _ctx(ctx), _service(this) {}
 
 StatusWith<SessionHandle> TransportLayerGRPC::connect(HostAndPort peer,
                                                       ConnectSSLMode sslMode,
@@ -186,7 +181,7 @@ Status TransportLayerGRPC::start() {
 }
 
 void TransportLayerGRPC::shutdown() {
-    _sessions.clear();
+    _workers.clear();
     _server->Shutdown();
 }
 
@@ -196,6 +191,24 @@ ReactorHandle TransportLayerGRPC::getReactor(WhichReactor which) {
 
 TransportLayerGRPC::~TransportLayerGRPC() {
     shutdown();
+}
+
+TransportLayerGRPC::Worker* TransportLayerGRPC::getLogicalConnectionWorker(
+    const std::string& lcid) {
+    // NOTE: maybe less lock contention with this approach, but requires double lookup for session
+    absl::flat_hash_map<std::string, WorkerPtr>::iterator sit = _workers.find(lcid);
+    if (sit == _workers.end()) {
+        stdx::lock_guard<Latch> lk(_mutex);
+        auto session = std::make_shared<GRPCSession>(this, lcid);
+        auto [entry, emplaced] = _workers.emplace(lcid, new Worker(_ctx, std::move(session)));
+        if (!emplaced) {
+            // throw an exception?
+        }
+
+        return entry->second.get();
+    }
+
+    return sit->second.get();
 }
 
 }  // namespace transport

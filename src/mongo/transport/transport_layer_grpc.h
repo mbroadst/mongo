@@ -51,7 +51,7 @@ class TransportLayerGRPC : public TransportLayer {
     TransportLayerGRPC& operator=(const TransportLayerGRPC&) = delete;
 
 public:
-    TransportLayerGRPC(ServiceEntryPoint* sep);
+    TransportLayerGRPC(ServiceEntryPoint* sep, ServiceContext* ctx);
     ~TransportLayerGRPC();
 
     StatusWith<SessionHandle> connect(HostAndPort peer,
@@ -79,6 +79,7 @@ private:
                                               mongodb::Message* response) override;
 
         TransportLayerGRPC* _tl;
+        static int32_t connCounter;
     };
 
     class GRPCSession : public Session {
@@ -99,10 +100,6 @@ private:
             return _tl;
         }
 
-        const std::string& lcid() const {
-            return _lcid;
-        }
-
         const HostAndPort& remote() const override {
             return _remote;
         }
@@ -119,13 +116,17 @@ private:
             return _localAddr;
         }
 
-        void end() override;
-        StatusWith<Message> sourceMessage() override;
+        void end() override {}
+        StatusWith<Message> sourceMessage() override {
+            MONGO_UNREACHABLE;
+        }
         Future<Message> asyncSourceMessage(const BatonHandle& handle = nullptr) override {
             return Future<Message>::makeReady(sourceMessage());
         }
 
-        Status sinkMessage(Message message) override;
+        Status sinkMessage(Message message) override {
+            MONGO_UNREACHABLE;
+        }
         Future<void> asyncSinkMessage(Message message,
                                       const BatonHandle& handle = nullptr) override {
             return Future<void>::makeReady(sinkMessage(message));
@@ -139,36 +140,58 @@ private:
         }
 
     protected:
-        friend class TransportLayerGRPC::TransportServiceImpl;
-        TransportLayerGRPC* _tl;
+        TransportLayer* _tl;
         std::string _lcid;
-
         HostAndPort _remote{};
         HostAndPort _local{};
         SockAddr _remoteAddr;
         SockAddr _localAddr;
+    };
 
+    class Worker : public std::enable_shared_from_this<Worker> {
+        Worker(const Worker&) = delete;
+        Worker& operator=(const Worker&) = delete;
+
+    public:
+        explicit Worker(ServiceContext* svcContext, transport::SessionHandle session);
+        ~Worker() {
+            // _workerCtx->markKilled();
+        }
+
+        void handleRequest(const mongodb::Message* request,
+                           mongodb::Message* response,
+                           grpc::ServerUnaryReactor* reactor);
+
+    private:
         struct PendingRequest {
             const mongodb::Message* request;
             mongodb::Message* response;
             grpc::ServerUnaryReactor* reactor;
         };
 
-        Mutex _mutex = MONGO_MAKE_LATCH("GRPCSession::_mutex");
-        // TODO: using PendingRequestPtr = std::unique_ptr<PendingRequest>;
-        MultiProducerSingleConsumerQueue<PendingRequest*> _pendingRequests;
-        PendingRequest* _currentRequest = nullptr;
+        ServiceEntryPoint* _sep;
+        ServiceContext* const _serviceContext;
+        transport::ServiceExecutor* _serviceExecutor;
+        transport::SessionHandle _sessionHandle;
+        const std::string _threadName;
+        ServiceContext::UniqueClient _dbClient;
+
+        stdx::thread _thread;
+        // ServiceContext::UniqueOperationContext _workerCtx;
+        MultiProducerSingleConsumerQueue<PendingRequest> _queue;
     };
 
+    using WorkerPtr = std::unique_ptr<Worker>;
+    Worker* getLogicalConnectionWorker(const std::string& lcid);
+
     ServiceEntryPoint* const _sep = nullptr;
+    ServiceContext* const _ctx = nullptr;
     stdx::thread _thread;
     std::unique_ptr<grpc::Server> _server;
     TransportServiceImpl _service;
 
     Mutex _mutex = MONGO_MAKE_LATCH("TransportLayerGRPC::_mutex");
-    using GRPCSessionHandle = std::shared_ptr<GRPCSession>;
-    absl::flat_hash_map<std::string, GRPCSessionHandle> _sessions;
-
+    absl::flat_hash_map<std::string, WorkerPtr> _workers;
 };
 
 }  // namespace transport
