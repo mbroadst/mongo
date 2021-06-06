@@ -287,6 +287,7 @@ if not has_option('noshell') and usemozjs:
             # please add that library as a private libdep of
             # mongo_initializers.
             "$BUILD_DIR/mongo/transport/transport_layer",
+            "$BUILD_DIR/mongo/transport/transport_layer_grpc",
             "$BUILD_DIR/mongo/util/net/ssl_manager",
             "$BUILD_DIR/mongo/util/signal_handlers",
             "$BUILD_DIR/third_party/shim_pcrecpp",

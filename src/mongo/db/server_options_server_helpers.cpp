@@ -306,8 +306,10 @@ Status storeServerOptions(const moe::Environment& params) {
 
     if (params.count("net.transportLayer")) {
         serverGlobalParams.transportLayer = params["net.transportLayer"].as<std::string>();
-        if (serverGlobalParams.transportLayer != "asio") {
-            return {ErrorCodes::BadValue, "Unsupported value for transportLayer. Must be \"asio\""};
+        if (serverGlobalParams.transportLayer != "asio" &&
+            serverGlobalParams.transportLayer != "grpc") {
+            return {ErrorCodes::BadValue,
+                    "Unsupported value for transportLayer. Must be \"asio\" or \"grpc\""};
         }
     }
 
@@ -372,10 +374,11 @@ Status storeServerOptions(const moe::Environment& params) {
                 serverGlobalParams.bind_ips.emplace_back("::");
             }
         } else {
-            boost::split(serverGlobalParams.bind_ips,
-                         bind_ip,
-                         [](char c) { return c == ','; },
-                         boost::token_compress_on);
+            boost::split(
+                serverGlobalParams.bind_ips,
+                bind_ip,
+                [](char c) { return c == ','; },
+                boost::token_compress_on);
         }
     }
 

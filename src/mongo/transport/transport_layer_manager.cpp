@@ -45,6 +45,7 @@
 #include "mongo/transport/service_executor_synchronous.h"
 #include "mongo/transport/session.h"
 #include "mongo/transport/transport_layer_asio.h"
+#include "mongo/transport/transport_layer_grpc.h"
 #include "mongo/util/net/ssl_types.h"
 #include "mongo/util/time_support.h"
 
@@ -137,12 +138,23 @@ std::unique_ptr<TransportLayer> TransportLayerManager::createWithConfig(
     const ServerGlobalParams* config, ServiceContext* ctx) {
     auto sep = ctx->getServiceEntryPoint();
 
+    std::vector<std::unique_ptr<TransportLayer>> transportLayers;
+    if (config->transportLayer == "grpc") {
+        transport::TransportLayerGRPC::Options options(config);
+        transportLayers.emplace_back(std::make_unique<transport::TransportLayerGRPC>(options, sep));
+        return std::make_unique<TransportLayerManager>(std::move(transportLayers));
+    }
+
     transport::TransportLayerASIO::Options opts(config);
     opts.transportMode = transport::Mode::kSynchronous;
+    transportLayers.emplace_back(std::make_unique<transport::TransportLayerASIO>(opts, sep));
 
-    std::vector<std::unique_ptr<TransportLayer>> retVector;
-    retVector.emplace_back(std::make_unique<transport::TransportLayerASIO>(opts, sep));
-    return std::make_unique<TransportLayerManager>(std::move(retVector));
+    // Listen for gRPC connections on 0.0.0.0:50051 at the same time as mongorpc, this
+    // makes it much easier to compare the two implementations.
+    transport::TransportLayerGRPC::Options options{{"0.0.0.0"}, 50051};
+    transportLayers.emplace_back(std::make_unique<transport::TransportLayerGRPC>(options, sep));
+
+    return std::make_unique<TransportLayerManager>(std::move(transportLayers));
 }
 
 #ifdef MONGO_CONFIG_SSL

@@ -35,7 +35,8 @@
 
 namespace mongo {
 
-ReplicaSetMonitorProtocol gReplicaSetMonitorProtocol{ReplicaSetMonitorProtocol::kStreamable};
+// TODO: gRPC transport can't do streamable yet
+ReplicaSetMonitorProtocol gReplicaSetMonitorProtocol{ReplicaSetMonitorProtocol::kScanning};
 
 std::string toString(ReplicaSetMonitorProtocol protocol) {
     if (protocol == ReplicaSetMonitorProtocol::kScanning) {

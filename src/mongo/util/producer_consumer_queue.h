@@ -531,6 +531,12 @@ public:
         });
     }
 
+    void waitForData(Interruptible* interruptible = Interruptible::notInterruptible()) {
+        return _popRunner([&](stdx::unique_lock<Latch>& lk) {
+            _waitForNonEmpty(lk, interruptible);
+        });
+    }
+
     // Waits for at least one item in the queue, then pops items out of the queue until it would
     // block
     //
